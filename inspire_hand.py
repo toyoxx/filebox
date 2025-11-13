@@ -9,153 +9,211 @@
 
 import rclpy
 from rclpy.node import Node
-
-# ROS2 message and service types
-from std_srvs.srv import Trigger, SetBool
-from std_msgs.msg import String
-
-# Inspire hand library
-from inspire_hand import InspireHand
+from std_srvs.srv import Trigger
+from sensor_msgs.msg import JointState
+from inspire_hand import Hand
+import threading
+import time
 
 
 class InspireHandNode(Node):
-    """
-    ROS2 wrapper node for Inspire RH56DFQ-2L hand.
-    Provides simple service interfaces for basic hand behaviors.
-    """
-
     def __init__(self):
-        super().__init__('inspire_hand_node')
+        super().__init__('inspire_hand')
 
-        # Parameters
-        self.declare_parameter('port', '/dev/ttyUSB0')
-        self.declare_parameter('baudrate', 115200)
-        self.declare_parameter('slave_id', 1)
-        self.declare_parameter('default_force', 500)
-        self.declare_parameter('default_speed', 800)
-        self.declare_parameter('status_rate', 10.0)  # Hz
+        # Serial port parameters
+        self.declare_parameter('serial_port_left', '/dev/ttyUSB0')
+        self.declare_parameter('serial_port_right', '/dev/ttyUSB1')
 
-        # Load parameters
-        port = self.get_parameter('port').value
-        baudrate = self.get_parameter('baudrate').value
-        slave_id = self.get_parameter('slave_id').value
-        self.default_force = self.get_parameter('default_force').value
-        self.default_speed = self.get_parameter('default_speed').value
-        status_rate = self.get_parameter('status_rate').value
+        # Movement parameters
+        self.declare_parameter('force', 100)
+        self.declare_parameter('speed', 50)
 
-        # Initialize hand
+        left_port = self.get_parameter('serial_port_left').get_parameter_value().string_value
+        right_port = self.get_parameter('serial_port_right').get_parameter_value().string_value
+        self.force = self.get_parameter('force').get_parameter_value().integer_value
+        self.speed = self.get_parameter('speed').get_parameter_value().integer_value
+
+        self.hands = {}
+        self.lock = threading.Lock()
+
+        # Connect to both hands
+        self._connect_hand('left', left_port)
+        self._connect_hand('right', right_port)
+
+        # Publisher for joint states
+        self.joint_pub = self.create_publisher(JointState, 'inspire_hand/joint_states', 10)
+
+        # Register behavior services for each hand
+        for side in ['left', 'right']:
+            self._register_services(side)
+
+        # Background thread for joint states
+        self.running = True
+        self.state_thread = threading.Thread(target=self._state_publisher, daemon=True)
+        self.state_thread.start()
+
+        self.get_logger().info("InspireHandNode initialized with dual-hand and parameterized control.")
+
+    # ---- Initialization ----
+    def _connect_hand(self, side, port):
         try:
-            self.hand = InspireHand(port=port, baudrate=baudrate, slave_id=slave_id)
-            self.get_logger().info(f'Connected to Inspire hand on {port} (baudrate={baudrate})')
+            hand = Hand(port)
+            hand.open()  # ensures communication starts
+            self.hands[side] = hand
+            self.get_logger().info(f"Connected to {side} hand on {port}")
         except Exception as e:
-            self.get_logger().error(f'Failed to connect to Inspire hand: {e}')
-            raise e
+            self.hands[side] = None
+            self.get_logger().warn(f"Could not connect to {side} hand on {port}: {e}")
 
-        # Define ROS services
-        self.srv_open_all = self.create_service(Trigger, 'open_all', self.handle_open_all)
-        self.srv_close_all = self.create_service(Trigger, 'close_all', self.handle_close_all)
-        self.srv_pinch = self.create_service(SetBool, 'pinch', self.handle_pinch)
-        self.srv_point = self.create_service(Trigger, 'point', self.handle_point)
-        self.srv_thumbs_up = self.create_service(Trigger, 'thumbs_up', self.handle_thumbs_up)
-        self.srv_grip = self.create_service(SetBool, 'grip', self.handle_grip)
+    def _register_services(self, side):
+        self.create_service(Trigger, f'inspire_hand/{side}/open', lambda req, s=side: self._srv_open(req, s))
+        self.create_service(Trigger, f'inspire_hand/{side}/close', lambda req, s=side: self._srv_close(req, s))
+        self.create_service(Trigger, f'inspire_hand/{side}/reset', lambda req, s=side: self._srv_reset(req, s))
+        self.create_service(Trigger, f'inspire_hand/{side}/pinch', lambda req, s=side: self._srv_pinch(req, s))
+        self.create_service(Trigger, f'inspire_hand/{side}/point', lambda req, s=side: self._srv_point(req, s))
+        self.create_service(Trigger, f'inspire_hand/{side}/thumbs_up', lambda req, s=side: self._srv_thumbs_up(req, s))
+        self.create_service(Trigger, f'inspire_hand/{side}/grip', lambda req, s=side: self._srv_grip(req, s))
 
-        # Publishers for feedback
-        self.pub_status = self.create_publisher(String, 'hand_status', 10)
-        self.pub_angles = self.create_publisher(String, 'finger_angles', 10)
+    # ---- Helpers ----
+    def _error_response(self, msg):
+        self.get_logger().error(msg)
+        return Trigger.Response(success=False, message=msg)
 
-        # Periodic publisher
-        self.timer = self.create_timer(1.0 / status_rate, self.publish_status)
+    def _success_response(self, msg):
+        self.get_logger().info(msg)
+        return Trigger.Response(success=True, message=msg)
 
-        self.get_logger().info('InspireHandNode initialized successfully.')
+    def _get_hand(self, side):
+        hand = self.hands.get(side)
+        if not hand:
+            self.get_logger().warn(f"{side} hand not connected.")
+        return hand
 
-    # === Service callbacks ===
-
-    def handle_open_all(self, request, response):
+    def _apply_force_speed(self, hand):
         try:
-            self.hand.open_all_fingers()
-            response.success = True
-            response.message = 'Opened all fingers.'
-        except Exception as e:
-            response.success = False
-            response.message = str(e)
-        return response
+            hand.set_force(self.force)
+            hand.set_speed(self.speed)
+        except AttributeError:
+            # Some Inspire drivers use different names, e.g. set_grip_force() / set_grip_speed()
+            try:
+                hand.set_grip_force(self.force)
+                hand.set_grip_speed(self.speed)
+            except Exception as e:
+                self.get_logger().warn(f"Force/speed control not available: {e}")
 
-    def handle_close_all(self, request, response):
+    # ---- Basic Services ----
+    def _srv_open(self, request, side):
+        hand = self._get_hand(side)
+        if not hand:
+            return self._error_response(f"{side} hand not connected.")
+        self._apply_force_speed(hand)
+        hand.open()
+        return self._success_response(f"{side} hand opened (force={self.force}, speed={self.speed}).")
+
+    def _srv_close(self, request, side):
+        hand = self._get_hand(side)
+        if not hand:
+            return self._error_response(f"{side} hand not connected.")
+        self._apply_force_speed(hand)
+        hand.close()
+        return self._success_response(f"{side} hand closed (force={self.force}, speed={self.speed}).")
+
+    def _srv_reset(self, request, side):
+        hand = self._get_hand(side)
+        if not hand:
+            return self._error_response(f"{side} hand not connected.")
+        self._apply_force_speed(hand)
+        hand.open()
+        return self._success_response(f"{side} hand reset.")
+
+    # ---- Behavior Services ----
+    def _srv_pinch(self, request, side):
+        hand = self._get_hand(side)
+        if not hand:
+            return self._error_response(f"{side} hand not connected.")
+        self._apply_force_speed(hand)
         try:
-            self.hand.close_all_fingers()
-            response.success = True
-            response.message = 'Closed all fingers.'
+            # Close thumb + index
+            hand.move_finger(0, 100, self.force, self.speed)
+            hand.move_finger(1, 100, self.force, self.speed)
+            for i in range(2, 5):
+                hand.move_finger(i, 0, self.force, self.speed)
+            return self._success_response(f"{side} hand pinch gesture executed.")
         except Exception as e:
-            response.success = False
-            response.message = str(e)
-        return response
+            return self._error_response(str(e))
 
-    def handle_pinch(self, request, response):
+    def _srv_point(self, request, side):
+        hand = self._get_hand(side)
+        if not hand:
+            return self._error_response(f"{side} hand not connected.")
+        self._apply_force_speed(hand)
         try:
-            if request.data:
-                self.hand.pinch(force=self.default_force)
-                response.message = f'Pinch with force {self.default_force}.'
-            else:
-                self.hand.open_all_fingers()
-                response.message = 'Pinch released (opened fingers).'
-            response.success = True
+            # Extend index finger only
+            hand.move_finger(1, 0, self.force, self.speed)
+            for i in [0, 2, 3, 4]:
+                hand.move_finger(i, 100, self.force, self.speed)
+            return self._success_response(f"{side} hand point gesture executed.")
         except Exception as e:
-            response.success = False
-            response.message = str(e)
-        return response
+            return self._error_response(str(e))
 
-    def handle_point(self, request, response):
+    def _srv_thumbs_up(self, request, side):
+        hand = self._get_hand(side)
+        if not hand:
+            return self._error_response(f"{side} hand not connected.")
+        self._apply_force_speed(hand)
         try:
-            self.hand.point()
-            response.success = True
-            response.message = 'Point gesture executed.'
+            # Extend thumb, close others
+            hand.move_finger(0, 0, self.force, self.speed)
+            for i in range(1, 5):
+                hand.move_finger(i, 100, self.force, self.speed)
+            return self._success_response(f"{side} hand thumbs-up gesture executed.")
         except Exception as e:
-            response.success = False
-            response.message = str(e)
-        return response
+            return self._error_response(str(e))
 
-    def handle_thumbs_up(self, request, response):
+    def _srv_grip(self, request, side):
+        hand = self._get_hand(side)
+        if not hand:
+            return self._error_response(f"{side} hand not connected.")
+        self._apply_force_speed(hand)
         try:
-            self.hand.thumbs_up()
-            response.success = True
-            response.message = 'Thumbs up gesture executed.'
+            # Full grip
+            for i in range(5):
+                hand.move_finger(i, 100, self.force, self.speed)
+            return self._success_response(f"{side} hand grip gesture executed.")
         except Exception as e:
-            response.success = False
-            response.message = str(e)
-        return response
+            return self._error_response(str(e))
 
-    def handle_grip(self, request, response):
-        try:
-            if request.data:
-                self.hand.grip(force=self.default_force)
-                response.message = f'Grip with force {self.default_force}.'
-            else:
-                self.hand.open_all_fingers()
-                response.message = 'Grip released (opened fingers).'
-            response.success = True
-        except Exception as e:
-            response.success = False
-            response.message = str(e)
-        return response
+    # ---- State Publisher ----
+    def _state_publisher(self):
+        rate = self.create_rate(10)
+        while rclpy.ok() and self.running:
+            with self.lock:
+                msg = JointState()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.name, msg.position = [], []
 
-    # === Status publisher ===
+                for side, hand in self.hands.items():
+                    if not hand:
+                        continue
+                    try:
+                        # Adapt depending on SDK: get_pos(), get_positions(), etc.
+                        positions = hand.get_positions()
+                        for i, pos in enumerate(positions):
+                            msg.name.append(f"{side}_finger_{i+1}")
+                            msg.position.append(pos)
+                    except Exception:
+                        self.get_logger().warn(f"Lost connection to {side} hand.")
+                        self.hands[side] = None
 
-    def publish_status(self):
-        try:
-            angles = self.hand.get_finger_angles()
-            status_msg = f'Angles: {angles}'
-            self.pub_angles.publish(String(data=str(angles)))
-            self.pub_status.publish(String(data=status_msg))
-        except Exception as e:
-            self.get_logger().warn(f'Failed to read status: {e}')
+                if msg.name:
+                    self.joint_pub.publish(msg)
 
+            time.sleep(0.1)
+
+    # ---- Shutdown ----
     def destroy_node(self):
-        try:
-            self.hand.close()
-        except Exception:
-            pass
+        self.running = False
         super().destroy_node()
-        self.get_logger().info('InspireHandNode shut down cleanly.')
 
 
 def main(args=None):
@@ -172,3 +230,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
